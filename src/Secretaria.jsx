@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, BookOpen, Bot, HelpCircle, Database } from 'lucide-react';
+import { Send, Bot, HelpCircle } from 'lucide-react';
 
 const EditalChat = () => {
   const [messages, setMessages] = useState([
@@ -12,9 +12,10 @@ const EditalChat = () => {
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
+  // ✅ Apenas variáveis PÚBLICAS ficam no frontend — são seguras por design
+  // A GROQ_API_KEY foi movida para os Secrets da Edge Function no Supabase
   const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
   const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-  const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY;
 
   const quickQuestions = [
     "Quem pode participar do PIBIC?",
@@ -31,55 +32,26 @@ const EditalChat = () => {
     scrollToBottom();
   }, [messages]);
 
-  const searchDocuments = async (query) => {
-    try {
-      console.log('🔍 Buscando documentos para:', query);
-
-      // Sem filtros na URL — evita erro 400 com camelCase no Supabase REST
-      // Filtragem de isActive e relevância feita no cliente
-      const textResponse = await fetch(
-        `${SUPABASE_URL}/rest/v1/documents?select=id,content,metadata,isActive`,
-        {
-          headers: {
-            'apikey': SUPABASE_ANON_KEY,
-            'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
-          }
-        }
-      );
-
-      if (!textResponse.ok) {
-        const error = await textResponse.text();
-        console.error('❌ Erro Supabase:', error);
-        throw new Error('Erro ao buscar documentos');
+  // Chama a Edge Function — toda a lógica sensível fica no servidor
+  const callChatRAG = async (query) => {
+    const response = await fetch(
+      `${SUPABASE_URL}/functions/v1/chat-rag`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({ query }),
       }
+    );
 
-      const allDocs = await textResponse.json();
-      console.log('✓ Total de docs:', allDocs.length);
-
-      const queryLower = query.toLowerCase();
-      const queryWords = queryLower.split(' ').filter(w => w.length > 2);
-
-      const scored = allDocs
-        .filter(doc => doc.content && doc.isActive !== false)
-        .map(doc => {
-          const contentLower = doc.content.toLowerCase();
-          const score = queryWords.reduce((acc, word) => {
-            return acc + (contentLower.includes(word) ? 1 : 0);
-          }, 0);
-          return { ...doc, score };
-        })
-        .filter(doc => doc.score > 0)
-        .sort((a, b) => b.score - a.score);
-
-      const results = scored.slice(0, 5);
-      console.log('✓ Documentos relevantes encontrados:', results.length);
-
-      return results;
-
-    } catch (error) {
-      console.error('❌ Erro na busca:', error);
-      return [];
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error || `Erro HTTP ${response.status}`);
     }
+
+    return response.json(); // { answer, sourcesCount }
   };
 
   const handleSend = async () => {
@@ -91,78 +63,20 @@ const EditalChat = () => {
     setIsLoading(true);
 
     try {
-      const relevantDocs = await searchDocuments(userMessage);
-
-      const context = relevantDocs.length > 0
-        ? relevantDocs.map((doc, idx) => {
-            const content = doc.content || '';
-            const preview = content.length > 500 ? content.substring(0, 500) + '...' : content;
-            const metaInfo = doc.metadata ? ` | Metadata: ${JSON.stringify(doc.metadata)}` : '';
-            return `[Documento ${idx + 1}${metaInfo}]\nConteúdo: ${preview}\n`;
-          }).join('\n---\n')
-        : 'Nenhum documento relevante encontrado na base de conhecimento.';
-
-      console.log('Contexto preparado com', relevantDocs.length, 'documentos');
-
-      // Chamada à API do Groq (compatível com OpenAI)
-      const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${GROQ_API_KEY}`
-        },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile', // Modelo rápido e capaz do Groq
-          messages: [
-            {
-              role: 'system',
-              content: `Você é um assistente especializado da Secretaria Virtual. Responda perguntas APENAS com base nos documentos fornecidos. Seja claro, objetivo e amigável. Se os documentos não contiverem a informação, diga isso honestamente.`
-            },
-            {
-              role: 'user',
-              content: `DOCUMENTOS DA BASE DE CONHECIMENTO:\n${context}\n\nPERGUNTA DO USUÁRIO:\n${userMessage}\n\nResponda de forma clara e útil:`
-            }
-          ],
-          temperature: 0.7,
-          max_tokens: 1000
-        })
-      });
-
-      if (!groqResponse.ok) {
-        const errorData = await groqResponse.json();
-        console.error('❌ Erro Groq:', errorData);
-        throw new Error(`Erro Groq: ${errorData.error?.message || 'Desconhecido'}`);
-      }
-
-      const groqData = await groqResponse.json();
-
-      if (groqData.choices && groqData.choices[0]?.message?.content) {
-        const assistantResponse = groqData.choices[0].message.content;
-        console.log('✓ Resposta gerada com sucesso');
-
-        setMessages(prev => [...prev, {
-          type: 'assistant',
-          content: assistantResponse,
-          sources: relevantDocs.length
-        }]);
-      } else {
-        throw new Error('Resposta inválida do Groq');
-      }
-
-    } catch (error) {
-      console.error('Erro completo:', error);
-
-      let errorMessage = 'Desculpe, ocorreu um erro ao processar sua pergunta.';
-
-      if (error.message.includes('Groq')) {
-        errorMessage += ' Verifique se a API Key do Groq está correta.';
-      } else if (error.message.includes('Supabase')) {
-        errorMessage += ' Verifique suas credenciais do Supabase.';
-      }
+      const { answer, sourcesCount } = await callChatRAG(userMessage);
 
       setMessages(prev => [...prev, {
         type: 'assistant',
-        content: errorMessage
+        content: answer,
+        sources: sourcesCount
+      }]);
+
+    } catch (error) {
+      console.error('Erro:', error);
+
+      setMessages(prev => [...prev, {
+        type: 'assistant',
+        content: 'Desculpe, ocorreu um erro ao processar sua pergunta. Tente novamente em instantes.'
       }]);
     } finally {
       setIsLoading(false);
@@ -180,7 +94,6 @@ const EditalChat = () => {
     }
   };
 
- 
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-white">
       <div className="bg-blue-600 text-white p-6 shadow-lg">
@@ -190,7 +103,7 @@ const EditalChat = () => {
             <div>
               <h1 className="text-2xl font-bold">Secretaria Virtual</h1>
               <p className="text-blue-100 text-sm">Pró-Reitoria de Pesquisa e Pós-Graduação - UFBA</p>
-              <p className="text-blue-100 text-sm">Desenvolvido por:  Muneo-PRPPG / Versão: 1.0.0-alpha.1</p>
+              <p className="text-blue-100 text-sm">Desenvolvido por: Muneo-PRPPG / Versão: 1.0.0-alpha.1</p>
             </div>
           </div>
         </div>
